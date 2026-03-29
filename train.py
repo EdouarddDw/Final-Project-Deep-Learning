@@ -2,22 +2,114 @@ from __future__ import annotations
 
 import argparse
 import csv
-import json
 import math
-import os
-import random
 import time
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any
+from typing import Any, Dict
 
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
-from data import prepare_oasst1_for_sft, create_dataloaders
-from models import ModelConfig, MiniLLM
-from utils import set_seed, get_device, count_trainable_params, global_grad_diagnostics, move_batch_to_device, decode_sample, save_json
+from data import create_dataloaders, prepare_oasst1_for_sft
+from models import MiniLLM, ModelConfig
+from utils import (
+    count_trainable_params,
+    decode_sample,
+    get_device,
+    global_grad_diagnostics,
+    move_batch_to_device,
+    save_json,
+    set_seed,
+)
+
+IGNORE_INDEX = -100
+
+
+# ============================================================
+# Safety helpers
+# ============================================================
+
+def validate_batch(batch: Dict[str, torch.Tensor], vocab_size: int) -> None:
+    input_ids = batch["input_ids"]
+    labels = batch["labels"]
+
+    if torch.isnan(input_ids.float()).any() or torch.isinf(input_ids.float()).any():
+        raise RuntimeError("input_ids contain NaN or Inf")
+
+    if torch.isnan(labels.float()).any() or torch.isinf(labels.float()).any():
+        raise RuntimeError("labels contain NaN or Inf")
+
+    if input_ids.numel() > 0:
+        input_min = int(input_ids.min().item())
+        input_max = int(input_ids.max().item())
+        if input_min < 0 or input_max >= vocab_size:
+            raise RuntimeError(
+                f"input_ids out of range for vocab_size={vocab_size}: min={input_min}, max={input_max}"
+            )
+
+    valid_mask = labels != IGNORE_INDEX
+    if valid_mask.any():
+        valid_labels = labels[valid_mask]
+        label_min = int(valid_labels.min().item())
+        label_max = int(valid_labels.max().item())
+        if label_min < 0 or label_max >= vocab_size:
+            raise RuntimeError(
+                f"labels out of range for vocab_size={vocab_size}: min={label_min}, max={label_max}"
+            )
+
+
+def ensure_finite_logits_and_loss(
+    logits: torch.Tensor,
+    loss: torch.Tensor | None,
+    batch: Dict[str, torch.Tensor],
+    global_step: int,
+    epoch: int,
+    iteration: int,
+) -> None:
+    if torch.isnan(logits).any() or torch.isinf(logits).any():
+        raise RuntimeError(
+            f"Invalid logits at epoch={epoch}, iter={iteration}, global_step={global_step}. "
+            f"logits_min={logits.min().item():.4e}, logits_max={logits.max().item():.4e}"
+        )
+
+    if loss is None:
+        raise RuntimeError(
+            f"Loss is None at epoch={epoch}, iter={iteration}, global_step={global_step}"
+        )
+
+    if torch.isnan(loss) or torch.isinf(loss):
+        valid_mask = batch["labels"] != IGNORE_INDEX
+        valid_count = int(valid_mask.sum().item())
+        raise RuntimeError(
+            f"Invalid loss at epoch={epoch}, iter={iteration}, global_step={global_step}. "
+            f"valid_target_count={valid_count}"
+        )
+
+
+def check_parameters_finite(model: MiniLLM, epoch: int, iteration: int, global_step: int) -> None:
+    for name, param in model.named_parameters():
+        if torch.isnan(param).any() or torch.isinf(param).any():
+            raise RuntimeError(
+                f"Invalid parameter after optimizer step: {name} at "
+                f"epoch={epoch}, iter={iteration}, global_step={global_step}"
+            )
+
+
+def get_batch_metrics(logits: torch.Tensor, labels: torch.Tensor) -> Dict[str, int]:
+    valid_mask = labels != IGNORE_INDEX
+    valid_targets = labels[valid_mask]
+
+    if valid_targets.numel() == 0:
+        return {"batch_correct": 0, "batch_tokens": 0}
+
+    valid_logits = logits[valid_mask]
+    preds = valid_logits.argmax(dim=-1)
+    batch_correct = int((preds == valid_targets).sum().item())
+    batch_tokens = int(valid_targets.numel())
+    return {"batch_correct": batch_correct, "batch_tokens": batch_tokens}
+
 
 #=============================================================
 # Evaluation
@@ -36,17 +128,15 @@ def evaluate(model: MiniLLM, loader, device: torch.device, max_batches: int | No
             break
 
         batch = move_batch_to_device(batch, device)
+        validate_batch(batch, model.config.vocab_size)
         logits, loss = model(batch["input_ids"], batch["labels"])
+        ensure_finite_logits_and_loss(logits, loss, batch, global_step=-1, epoch=-1, iteration=batch_idx)
 
-        valid_mask = batch["labels"] != -100
-        valid_targets = batch["labels"][valid_mask]
-        valid_logits = logits[valid_mask]
-
-        if valid_targets.numel() > 0:
-            preds = valid_logits.argmax(dim=-1)
-            total_correct += (preds == valid_targets).sum().item()
-            total_tokens += valid_targets.numel()
-            total_loss += loss.item() * valid_targets.numel()
+        metrics = get_batch_metrics(logits, batch["labels"])
+        if metrics["batch_tokens"] > 0:
+            total_correct += metrics["batch_correct"]
+            total_tokens += metrics["batch_tokens"]
+            total_loss += float(loss.item()) * metrics["batch_tokens"]
 
     avg_loss = total_loss / max(total_tokens, 1)
     token_acc = total_correct / max(total_tokens, 1)
@@ -70,16 +160,15 @@ def test_run(model: MiniLLM, loader, device: torch.device) -> None:
 
     batch = next(iter(loader))
     batch = move_batch_to_device(batch, device)
+    validate_batch(batch, model.config.vocab_size)
 
     logits, loss = model(batch["input_ids"], batch["labels"])
+    ensure_finite_logits_and_loss(logits, loss, batch, global_step=0, epoch=0, iteration=0)
 
     assert logits.shape[:2] == batch["input_ids"].shape, (
         f"Logits shape {tuple(logits.shape)} is incompatible with input shape "
         f"{tuple(batch['input_ids'].shape)}"
     )
-
-    if loss is None:
-        raise RuntimeError("Loss is None during test run.")
 
     loss.backward()
 
@@ -136,9 +225,6 @@ def train(args) -> None:
     device = get_device()
     print("Device:", device)
 
-    # --------------------------------------------------------
-    # Run folders
-    # --------------------------------------------------------
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = args.run_name or f"chatbot_{timestamp}"
     run_dir = Path(args.output_dir) / run_name
@@ -151,9 +237,6 @@ def train(args) -> None:
 
     writer = SummaryWriter(log_dir=str(run_dir / "tb"))
 
-    # --------------------------------------------------------
-    # Data
-    # --------------------------------------------------------
     print("\nLoading and preparing dataset...")
 
     bundle = prepare_oasst1_for_sft(
@@ -179,9 +262,6 @@ def train(args) -> None:
     max_train_len = max(len(x["input_ids"]) for x in bundle["train_tokenized"][: min(1000, len(bundle["train_tokenized"]))])
     print("Max tokenized length in inspected train examples:", max_train_len)
 
-    # --------------------------------------------------------
-    # Model
-    # --------------------------------------------------------
     config = ModelConfig(
         vocab_size=len(tokenizer),
         block_size=args.block_size,
@@ -210,9 +290,6 @@ def train(args) -> None:
         betas=(args.beta1, args.beta2),
     )
 
-    # --------------------------------------------------------
-    # Save static run artifacts
-    # --------------------------------------------------------
     run_config = {
         "run_name": run_name,
         "seed": args.seed,
@@ -255,7 +332,6 @@ def train(args) -> None:
             "epoch_seconds",
         ])
 
-    # Save a debug sample from the dataset for later inspection
     with open(sample_dir / "train_example_0.txt", "w", encoding="utf 8") as f:
         f.write("RAW EXAMPLE\n\n")
         for msg in bundle["train_examples"][0]["messages"]:
@@ -263,9 +339,6 @@ def train(args) -> None:
             f.write(msg["content"])
             f.write("\n\n")
 
-    # --------------------------------------------------------
-    # Training loop
-    # --------------------------------------------------------
     global_step = 0
     best_val_loss = float("inf")
     training_start = time.time()
@@ -283,36 +356,36 @@ def train(args) -> None:
 
         for it, batch in enumerate(train_loader, start=1):
             batch = move_batch_to_device(batch, device)
-
-            logits, loss = model(batch["input_ids"], batch["labels"])
+            validate_batch(batch, model.config.vocab_size)
 
             optimizer.zero_grad(set_to_none=True)
+            logits, loss = model(batch["input_ids"], batch["labels"])
+            ensure_finite_logits_and_loss(logits, loss, batch, global_step=global_step, epoch=epoch, iteration=it)
+
             loss.backward()
+
+            raw_grad_norm, raw_grad_maxabs = global_grad_diagnostics(model)
 
             if args.grad_clip is not None and args.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
             last_grad_norm, last_grad_maxabs = global_grad_diagnostics(model)
             optimizer.step()
+            check_parameters_finite(model, epoch=epoch, iteration=it, global_step=global_step)
 
             with torch.no_grad():
-                valid_mask = batch["labels"] != -100
-                valid_targets = batch["labels"][valid_mask]
-                valid_logits = logits[valid_mask]
+                metrics = get_batch_metrics(logits, batch["labels"])
+                batch_correct = metrics["batch_correct"]
+                batch_tokens = metrics["batch_tokens"]
 
-                if valid_targets.numel() > 0:
-                    preds = valid_logits.argmax(dim=-1)
-                    batch_correct = (preds == valid_targets).sum().item()
-                    batch_tokens = valid_targets.numel()
-                else:
-                    batch_correct = 0
-                    batch_tokens = 0
+            if batch_tokens > 0:
+                running_loss_sum += float(loss.item()) * batch_tokens
+                running_tokens += batch_tokens
+                running_correct += batch_correct
 
-            running_loss_sum += loss.item() * max(batch_tokens, 1)
-            running_tokens += batch_tokens
-            running_correct += batch_correct
-
-            writer.add_scalar("train/loss_iter", loss.item(), global_step)
+            writer.add_scalar("train/loss_iter", float(loss.item()), global_step)
+            writer.add_scalar("train/grad_norm_raw", raw_grad_norm, global_step)
+            writer.add_scalar("train/grad_maxabs_raw", raw_grad_maxabs, global_step)
             writer.add_scalar("train/grad_norm", last_grad_norm, global_step)
             writer.add_scalar("train/grad_maxabs", last_grad_maxabs, global_step)
             writer.add_scalar("train/lr_iter", optimizer.param_groups[0]["lr"], global_step)
@@ -323,7 +396,7 @@ def train(args) -> None:
                 print(
                     f"Epoch {epoch:02d} Iter {it:04d} | "
                     f"loss={avg_loss:.4f} | token_acc={avg_acc:.4f} | "
-                    f"grad_norm={last_grad_norm:.2e}"
+                    f"grad_norm_raw={raw_grad_norm:.2e} | grad_norm={last_grad_norm:.2e}"
                 )
 
             if args.snapshot_every > 0 and global_step > 0 and global_step % args.snapshot_every == 0:
@@ -419,7 +492,6 @@ def train(args) -> None:
             )
             save_checkpoint(ckpt_dir / "best.pt", best_payload)
 
-        # Save one decoded training sample batch per epoch for later debugging
         with open(sample_dir / f"epoch_{epoch:03d}_sample.txt", "w", encoding="utf 8") as f:
             batch = next(iter(train_loader))
             f.write("INPUT IDS DECODED\n\n")
@@ -441,36 +513,31 @@ def train(args) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train a small chatbot transformer")
 
-    # Run settings
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default="./runs/chatbot")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--test_run", action="store_true")
 
-    # Data
     parser.add_argument("--tokenizer_name", type=str, default="gpt2")
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--block_size", type=int, default=512)
     parser.add_argument("--train_on_all_assistant_tokens", action="store_true")
 
-    # Model
     parser.add_argument("--n_embd", type=int, default=384)
     parser.add_argument("--n_head", type=int, default=6)
     parser.add_argument("--n_layer", type=int, default=6)
     parser.add_argument("--dropout", type=float, default=0.2)
 
-    # Optimization
     parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--beta1", type=float, default=0.9)
     parser.add_argument("--beta2", type=float, default=0.95)
     parser.add_argument("--grad_clip", type=float, default=1.0)
 
-    # Logging and checkpoints
     parser.add_argument("--log_every", type=int, default=50)
-    parser.add_argument("--snapshot_every", type=int, default=500)
+    parser.add_argument("--snapshot_every", type=int, default=10000)
     parser.add_argument("--eval_max_batches", type=int, default=None)
 
     return parser
@@ -484,3 +551,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
