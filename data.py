@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 
 from datasets import Dataset, load_dataset
 from transformers import AutoTokenizer
-
+from utils import dataset_to_row_dict, build_children_index, trace_path_to_root  
 
 # =========================================================
 # 1. Loading raw dataset
@@ -24,54 +24,9 @@ def load_oasst1() -> Dict[str, Dataset]:
 
 
 # =========================================================
-# 2. Raw row utilities
+# 2. Tree -> conversation path examples
 # =========================================================
 
-def dataset_to_row_dict(dataset: Dataset) -> Dict[str, Dict[str, Any]]:
-    """
-    Convert a Hugging Face dataset split into a dictionary indexed by message_id.
-    """
-    row_dict = {}
-    for row in dataset:
-        row_dict[row["message_id"]] = row
-    return row_dict
-
-
-def build_children_index(dataset: Dataset) -> Dict[Optional[str], List[str]]:
-    """
-    Build parent_id -> [child_message_id, ...] mapping.
-    """
-    children: Dict[Optional[str], List[str]] = {}
-
-    for row in dataset:
-        parent_id = row.get("parent_id")
-        msg_id = row["message_id"]
-        children.setdefault(parent_id, []).append(msg_id)
-
-    return children
-
-
-# =========================================================
-# 3. Tree -> conversation path examples
-# =========================================================
-
-def trace_path_to_root(
-    message_id: str,
-    row_dict: Dict[str, Dict[str, Any]]
-) -> List[Dict[str, Any]]:
-    """
-    Return the path from root to the given node.
-    """
-    path = []
-    current_id = message_id
-
-    while current_id is not None:
-        row = row_dict[current_id]
-        path.append(row)
-        current_id = row.get("parent_id")
-
-    path.reverse()
-    return path
 
 
 def normalize_role(raw_role: str) -> str:
@@ -416,7 +371,7 @@ def preview_example(example: Dict[str, Any]) -> None:
         print()
 
 def main():
-
+    #sanity checks making sure everything works.
     bundle = prepare_oasst1_for_sft(
         model_name="gpt2",
         max_length=1024,

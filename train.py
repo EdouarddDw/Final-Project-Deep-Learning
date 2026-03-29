@@ -17,67 +17,9 @@ from torch.utils.tensorboard import SummaryWriter
 
 from data import prepare_oasst1_for_sft, create_dataloaders
 from models import ModelConfig, MiniLLM
+from utils import set_seed, get_device, count_trainable_params, global_grad_diagnostics, move_batch_to_device, decode_sample, save_json
 
-
-# ============================================================
-# Utilities
-# ============================================================
-
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
-def get_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-
-def count_trainable_params(model: torch.nn.Module) -> int:
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-
-def global_grad_diagnostics(model: torch.nn.Module) -> tuple[float, float]:
-    """
-    Returns:
-        grad_norm: global L2 norm of gradients
-        grad_maxabs: largest absolute gradient entry
-    """
-    total_norm_sq = 0.0
-    maxabs_overall = 0.0
-
-    for p in model.parameters():
-        if p.grad is None:
-            continue
-        g = p.grad
-        l2 = g.norm(2).item()
-        total_norm_sq += l2 ** 2
-        maxabs = g.abs().max().item()
-        if maxabs > maxabs_overall:
-            maxabs_overall = maxabs
-
-    return math.sqrt(total_norm_sq), maxabs_overall
-
-
-def move_batch_to_device(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
-    return {k: v.to(device) for k, v in batch.items()}
-
-
-def decode_sample(tokenizer, token_ids: torch.Tensor) -> str:
-    ids = token_ids.detach().cpu().tolist()
-    return tokenizer.decode(ids, skip_special_tokens=False)
-
-
-def save_json(path: Path, obj: Dict[str, Any]) -> None:
-    with open(path, "w", encoding="utf 8") as f:
-        json.dump(obj, f, indent=2)
-
-
-# ============================================================
+#=============================================================
 # Evaluation
 # ============================================================
 
